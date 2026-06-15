@@ -327,8 +327,6 @@ it.admin
 
 ---
 
-## Step 6 — Confirm OS Fingerprinting
-
 
 ## Step 6 — Confirm OS Fingerprinting
 
@@ -555,7 +553,9 @@ DeviceProcessEvents
 
 ## Step 13 — Identify Trusted Automation Abuse
 
-**What I was looking for:** an existing operational script that already ran repeatedly without interactive logons — something the attacker could ride for staging instead of creating new, obvious automation.
+**What I was looking for:** an existing operational script that already ran repeatedly without interactive logons,something the attacker could ride for staging instead of creating new, obvious automation.
+
+Attackers often prefer trusted automation paths because they blend into normal administrative or service-account activity. A backup script is especially interesting because it may already have access to useful files, predictable execution patterns, and service-account permissions.
 
 Discovery query:
 
@@ -570,6 +570,7 @@ DeviceProcessEvents
 ```
 
 <img width="1527" height="661" alt="image" src="https://github.com/user-attachments/assets/f680a736-e604-48ae-8270-87c7fea627d1" />
+
 Focused query:
 
 ```kql
@@ -590,7 +591,8 @@ DeviceProcessEvents
 | where Timestamp between (datetime(2026-02-04) .. datetime(2026-02-14))
 | where DeviceName has "rocky83"
 | where ProcessCommandLine has "/opt/backup/scripts/backup_manifest.sh"
-| where FileName in~ ("cat", "tail", "tee", "bash", "sh", "sudo")or ProcessCommandLine has_any ("tee -a", "bash", "sh", "cat", "tail", "sudo")
+| where FileName in~ ("cat", "tail", "tee", "bash", "sh", "sudo")
+    or ProcessCommandLine has_any ("tee -a", "bash", "sh", "cat", "tail", "sudo")
 | project Timestamp, AccountName, FileName, ProcessCommandLine,InitiatingProcessFileName, InitiatingProcessCommandLine, ProcessId
 | order by Timestamp asc
 ```
@@ -603,10 +605,15 @@ DeviceProcessEvents
 ```text
 /opt/backup/scripts/backup_manifest.sh
 ```
+The validation rows show activity around the same trusted script path. The script was written with tee, assigned to the svc.backup account, permissioned with chmod, executed under svc.backup, and later inspected or appended by it.admin.
 
-This script path is the confirmed answer. Specific modification or execution claims should be validated from the corresponding process rows before being treated as confirmed.
+This supports treating /opt/backup/scripts/backup_manifest.sh as a trusted automation path that was abused or prepared for repeatable operations.
+
+This finding does not by itself prove final exfiltration. Final exfiltration is supported later by the archive staging and Discord webhook upload evidence.
+
 
 > 🚩 **Q13 — Trusted Script:** `/opt/backup/scripts/backup_manifest.sh`
+> MITRE: T1059.004 — Unix Shell; T1036 — Masquerading / Trusted Path Abuse
 
 ---
 
@@ -698,6 +705,8 @@ DeviceLogonEvents
     LogonTypes=make_set(LogonType, 20)
     by AccountName
 ```
+<img width="1236" height="577" alt="image" src="https://github.com/user-attachments/assets/34892bc2-cc52-4381-b1ec-cad18026d9ae" />
+
 
 **Finding:** The suspicious identity was:
 
@@ -811,33 +820,91 @@ Later edits used `vim`, but the initial creation was performed by `cat`.
 
 ## Step 19 — Identify the Service File Version Around the C2 Timeframe
 
-**What I was looking for:** the SHA256 of the service file version associated with the C2 timeframe.
+**What I was looking for:** the SHA256 hash of the `integration-monitor.service` file version associated with the Python reverse-shell C2 timeframe.
 
+The attacker created or modified a systemd service file named `integration-monitor.service`. Because multiple versions of this service file appeared in the timeline, I correlated service-file events with Python reverse-shell activity to identify the service-file hash that **immediately preceded** the initial C2 execution window.
+
+**Correlation query:**
 ```kql
+let start = datetime(2026-02-04);
+let end = datetime(2026-02-14);
+let servicePath = "/etc/systemd/system/integration-monitor.service";
+let serviceEvents =
 DeviceFileEvents
-| where Timestamp between (datetime(2026-02-04) .. datetime(2026-02-14))
+| where Timestamp between (start .. end)
 | where DeviceName has "rocky83"
-| where FolderPath == "/etc/systemd/system/integration-monitor.service"
-| project Timestamp, ActionType, FileName, FolderPath, SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine,InitiatingProcessId
-| order by Timestamp asc
+| where FolderPath == servicePath
+| project
+    JoinKey = 1,
+    ServiceEventTime = Timestamp,
+    ActionType,
+    SHA256,
+    ServiceInitiatingProcess = InitiatingProcessFileName,
+    ServiceInitiatingCommand = InitiatingProcessCommandLine;
+let c2Events =
+DeviceProcessEvents
+| where Timestamp between (datetime(2026-02-11 04:15:00) .. datetime(2026-02-11 04:20:00))
+| where DeviceName has "rocky83"
+| where ProcessCommandLine has_all ("import socket", "20.62.27.80", "/bin/sh")
+| project
+    JoinKey = 1,
+    C2Time = Timestamp,
+    C2Account = AccountName,
+    C2FileName = FileName,
+    C2Command = ProcessCommandLine,
+    C2ProcessId = ProcessId,
+    C2Parent = InitiatingProcessFileName,
+    C2ParentCommand = InitiatingProcessCommandLine;
+serviceEvents
+| join kind=inner c2Events on JoinKey
+| where ServiceEventTime < C2Time
+| summarize arg_max(ServiceEventTime, *) by C2Time, C2Command
+| project
+    ServiceEventTime,
+    C2Time,
+    SHA256,
+    ActionType,
+    ServiceInitiatingProcess,
+    ServiceInitiatingCommand,
+    C2Account,
+    C2FileName,
+    C2Command,
+    C2Parent,
+    C2ParentCommand
+| order by C2Time asc
 ```
+<img width="1567" height="760" alt="image" src="https://github.com/user-attachments/assets/ab20faa5-1480-46dd-a982-e0f0083760b6" />
 
-<img width="1512" height="417" alt="image" src="https://github.com/user-attachments/assets/f9402991-5582-4fd6-a338-27b41c85dc39" />
 
-
-**Finding:** The relevant service-file SHA256 identified from file telemetry was:
-
+**Finding:** The service-file version immediately preceding the initial Python reverse-shell C2 activity had the following SHA256:
 ```text
 f71ea834a9be9fb0e90c7b496e5312072fffedf1d1c0377957e05714bdac37b8
 ```
 
-This hash should be treated as the service-file version associated with the C2 timeframe only if its modification timestamp occurred before the reverse shell execution and no later service modification occurred before that C2 event.
+The relevant timeline correlation was:
+```text
+Service file event:  2026-02-11 04:16:01 UTC
+Initial C2 activity: 2026-02-11 04:16:21 UTC
+C2 destination:      20.62.27.80:443
+C2 process:          python3.9
+C2 parent context:   systemd
+```
 
-> 🚩 **Q19 — Service File SHA256:** `f71ea834a9be9fb0e90c7b496e5312072fffedf1d1c0377957e05714bdac37b8`
+The service-file event was initiated through:
+```text
+/usr/bin/vim /etc/systemd/system/integration-monitor.service
+```
+
+The C2 command showed a Python reverse shell connecting to `20.62.27.80:443` and spawning an interactive `/bin/sh` session. This correlation supports the assessment that the `f71ea834…dac37b8` service-file version was the relevant version for the initial C2 timeframe.
+
+This finding supports the systemd persistence and reverse-shell timeline, but it should not be used by itself to claim final data exfiltration — final exfiltration is supported later by the archive staging and Discord webhook upload evidence.
+
+> 🚩 **Q19 — Service File SHA256 Used for C2:** `f71ea834a9be9fb0e90c7b496e5312072fffedf1d1c0377957e05714bdac37b8`
+> **MITRE:** T1543.002 — Systemd Service; T1059.006 — Python; T1095 — Non-Application Layer Protocol
 
 ---
 
-### Step 20 — Extract the Reverse Shell Command
+## Step 20 — Extract the Reverse Shell Command
 
 **What I was looking for:** Python reverse shell process execution.
 ```kql
